@@ -10,10 +10,10 @@ Repository operations require Git 2.36 or later.
 go mod download                  # install dependencies
 go build -o gh-stack .           # build (produces ./gh-stack binary)
 go vet ./...                     # static analysis. Run before tests.
-go test -race -count=1 ./...     # all tests with race detection
+go run ./scripts/test -workers 4 # full race-enabled suite in isolated processes
 ```
 
-Always run `go vet` before `go test`. CI runs both on every push/PR across ubuntu, windows, and macOS (`test.yml`).
+Always run `go vet` before tests. See [CONTRIBUTING.md](CONTRIBUTING.md#test) for the alternative canonical `go test` command, targeted tests, and timing artifacts. CI runs the full platform-applicable suite with race detection on Linux, macOS, and Windows, with a cross-shard completion gate.
 
 There is no Makefile, linter config, or code generation step. The standard Go toolchain is all that's needed.
 
@@ -134,7 +134,7 @@ if errors.As(err, &exitErr) { ... }
 
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
-| `test.yml` | push to main, PRs | `go vet` + `go test -race -count=1 ./...` on 3 OS matrix |
+| `test.yml` | push to main, PRs | `go vet` + full race-enabled process shards on 3 OSes; verified completion gate |
 | `release.yml` | `v*` tags | Cross-platform precompiled binaries via `cli/gh-extension-precompile` |
 | `docs.yml` | push to main (docs/**) | Builds Astro/Starlight docs, deploys to GitHub Pages |
 
