@@ -90,6 +90,13 @@ func stackLabel(number int) string {
 	return fmt.Sprintf(" (stack #%d)", number)
 }
 
+func linkedStackLabel(cfg *config.Config, number int) string {
+	if number <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (stack %s)", cfg.StackLink(number))
+}
+
 // stackNumberByID resolves an internal stack ID (as stored in the local stack
 // file) to its human-facing stack number by consulting the remote stack list.
 // Returns ok=false when no remote stack matches the ID (e.g. it was deleted).
@@ -2161,7 +2168,7 @@ func unstackAndKeepLocal(cfg *config.Config, client github.ClientOps, sf *stack.
 	if remote == nil {
 		cfg.Warningf("Remote stack already removed")
 	} else if prepareStackRecreation(s, remote) {
-		cfg.Infof("Merged pull requests remain stacked on GitHub%s", stackLabel(remote.Number))
+		cfg.Infof("Merged pull requests remain stacked on GitHub%s", linkedStackLabel(cfg, remote.Number))
 	} else if remaining, dissolved, unstackErr := client.Unstack(remote.Number); unstackErr != nil {
 		var httpErr *api.HTTPError
 		if errors.As(unstackErr, &httpErr) && httpErr.StatusCode == 404 {
@@ -2176,8 +2183,8 @@ func unstackAndKeepLocal(cfg *config.Config, client github.ClientOps, sf *stack.
 	} else if dissolved {
 		cfg.Successf("Remote stack removed%s", stackLabel(remote.Number))
 	} else {
-		cfg.Successf("Pull requests unstacked on GitHub%s", stackLabel(remote.Number))
-		cfg.Infof("Merged pull requests remain stacked on GitHub%s", stackLabel(remote.Number))
+		cfg.Successf("Pull requests unstacked on GitHub%s", linkedStackLabel(cfg, remote.Number))
+		cfg.Infof("Merged pull requests remain stacked on GitHub%s", linkedStackLabel(cfg, remote.Number))
 	}
 
 	s.ID = ""

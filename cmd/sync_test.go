@@ -1773,6 +1773,7 @@ func runSyncWithGitHub(t *testing.T, gitMock *git.MockOps, ghMock *github.MockCl
 	defer restore()
 
 	cfg, _, errR := config.NewTestConfig()
+	setTestRepo(cfg)
 	cfg.GitHubClientOverride = ghMock
 	cmd := SyncCmd(cfg)
 	cmd.SetOut(io.Discard)
@@ -1788,6 +1789,7 @@ func runSyncWithGitHub(t *testing.T, gitMock *git.MockOps, ghMock *github.MockCl
 // branches already have open PRs but no stack exists on GitHub, sync creates the
 // stack object and reports "Stack synced".
 func TestSync_CreatesRemoteStackWhenPRsExist(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	s := stack.Stack{
 		Trunk:    stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}},
@@ -1818,6 +1820,7 @@ func TestSync_CreatesRemoteStackWhenPRsExist(t *testing.T) {
 	assert.Equal(t, []int{101, 102}, createdWith, "should create the stack from both PR numbers")
 	assert.Equal(t, 1, listCalls, "should issue exactly one ListStacks on the create path (no redundant round-trip)")
 	assert.Contains(t, output, "Stack created on GitHub with 2 PRs")
+	assert.Contains(t, output, "\x1b]8;;https://github.com/o/r/stack/7\x1b\\#7\x1b]8;;\x1b\\")
 	assert.Contains(t, output, "Stack synced")
 	assert.NotContains(t, output, "Branches synced")
 
@@ -1832,6 +1835,7 @@ func TestSync_CreatesRemoteStackWhenPRsExist(t *testing.T) {
 // already lists exactly the local PRs, sync records its ID without issuing a
 // redundant create/update and still reports "Stack synced".
 func TestSync_AdoptsExistingEqualRemoteStack(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "0")
 	s := stack.Stack{
 		Trunk:    stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}},
@@ -1857,6 +1861,7 @@ func TestSync_AdoptsExistingEqualRemoteStack(t *testing.T) {
 	output := runSyncWithGitHub(t, newSyncMockNoRebase(tmpDir, "b1"), ghMock)
 
 	assert.Contains(t, output, "already up to date")
+	assert.Contains(t, output, "#9 (https://github.com/o/r/stack/9)")
 	assert.Contains(t, output, "Stack synced")
 	assert.NotContains(t, output, "Branches synced")
 
@@ -1868,6 +1873,7 @@ func TestSync_AdoptsExistingEqualRemoteStack(t *testing.T) {
 // TestSync_UpdatesPartialRemoteStack verifies that when a remote stack contains
 // only some of the local PRs, sync updates it with the full list.
 func TestSync_UpdatesPartialRemoteStack(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	s := stack.Stack{
 		Trunk:    stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}, {Branch: "b3"}},
@@ -1902,6 +1908,7 @@ func TestSync_UpdatesPartialRemoteStack(t *testing.T) {
 	assert.Equal(t, 9, updatedNumber)
 	assert.Equal(t, []int{103}, addedWith)
 	assert.Contains(t, output, "Stack updated on GitHub with 3 PRs")
+	assert.Contains(t, output, "\x1b]8;;https://github.com/o/r/stack/9\x1b\\#9\x1b]8;;\x1b\\")
 	assert.Contains(t, output, "Stack synced")
 	assert.NotContains(t, output, "Branches synced")
 
@@ -2475,19 +2482,23 @@ func TestSync_Divergent_UseRemote_DirtyBlocked(t *testing.T) {
 
 // The keep-local resolution stops before pushing or recreating the stack.
 func TestSync_Divergent_DeleteRemote(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	mergedAt := "2026-01-01T00:00:00Z"
+	mergedRemnant := &github.RemoteStack{
+		ID: 9, Number: 9, PullRequests: []int{101},
+		PRDetails: []github.RemoteStackPR{{Number: 101, MergedAt: &mergedAt}},
+	}
 	for _, tc := range []struct {
-		name        string
-		remaining   *github.RemoteStack
-		apiErr      error
-		lookupFails bool
-		wantErr     error
+		name          string
+		remaining     *github.RemoteStack
+		apiErr        error
+		lookupFails   bool
+		alreadyMerged bool
+		wantErr       error
 	}{
 		{name: "dissolved"},
-		{name: "merged", remaining: &github.RemoteStack{
-			ID: 9, Number: 9, PullRequests: []int{101},
-			PRDetails: []github.RemoteStackPR{{Number: 101, MergedAt: &mergedAt}},
-		}},
+		{name: "merged", remaining: mergedRemnant},
+		{name: "already merged", remaining: mergedRemnant, alreadyMerged: true},
 		{name: "queued", remaining: &github.RemoteStack{ID: 9, Number: 9, PullRequests: []int{102}}, wantErr: ErrConflict},
 		{name: "server rejection", apiErr: &api.HTTPError{StatusCode: 422, Message: "Pull requests cannot be removed"}, wantErr: ErrAPIFailure},
 		{name: "lookup failure", lookupFails: true, wantErr: ErrAPIFailure},
@@ -2503,6 +2514,9 @@ func TestSync_Divergent_DeleteRemote(t *testing.T) {
 				lookups++
 				if tc.lookupFails && lookups > 1 {
 					return nil, assert.AnError
+				}
+				if tc.alreadyMerged && lookups > 1 {
+					return []github.RemoteStack{*mergedRemnant}, nil
 				}
 				return listStacks()
 			}
@@ -2522,12 +2536,13 @@ func TestSync_Divergent_DeleteRemote(t *testing.T) {
 			mock := newSyncMockNoRebase(tmpDir, "b1")
 			mock.PushFn = func(string, []string, bool, bool) error { pushed = true; return nil }
 			output, err := runSyncCfg(t, mock, func(cfg *config.Config) {
+				setTestRepo(cfg)
 				cfg.GitHubClientOverride = ghMock
 				cfg.ForceInteractive = true
 				cfg.SelectFn = func(_, _ string, _ []string) (int, error) { return 1, nil }
 			})
 
-			assert.Equal(t, !tc.lookupFails, unstacked)
+			assert.Equal(t, !tc.lookupFails && !tc.alreadyMerged, unstacked)
 			assert.False(t, pushed)
 			assert.NotContains(t, output, "Stack synced")
 			assert.NotContains(t, output, "Branches synced")
@@ -2545,11 +2560,16 @@ func TestSync_Divergent_DeleteRemote(t *testing.T) {
 				assert.Contains(t, output, "gh stack submit")
 				if tc.remaining != nil {
 					assert.Contains(t, output, "remain stacked on GitHub")
+					link := "\x1b]8;;https://github.com/o/r/stack/9\x1b\\#9\x1b]8;;\x1b\\"
+					assert.Contains(t, output, "Merged pull requests remain stacked on GitHub (stack "+link+")")
+					if !tc.alreadyMerged {
+						assert.Contains(t, output, "Pull requests unstacked on GitHub (stack "+link+")")
+					}
 					assert.NotContains(t, output, "Remote stack removed")
 					assert.NotContains(t, output, "only the stack on GitHub was removed")
 					assert.True(t, sf.Stacks[0].Branches[0].IsMerged())
 				} else {
-					assert.Contains(t, output, "Remote stack removed")
+					assert.Contains(t, output, "Remote stack removed (stack #9)")
 				}
 			}
 		})

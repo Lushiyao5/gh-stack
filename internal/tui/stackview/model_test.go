@@ -42,6 +42,42 @@ func keyMsg(k string) tea.KeyMsg {
 
 var testTrunk = stack.BranchRef{Branch: "main"}
 
+func TestStackHeaderLink(t *testing.T) {
+	const url = "https://github.example.com/o/r/stack/7"
+	for _, merged := range []bool{false, true} {
+		t.Run(fmt.Sprint(merged), func(t *testing.T) {
+			nodes := makeNodes("feature")
+			nodes[0].Ref.PullRequest = &stack.PullRequestRef{Number: 42, Merged: merged}
+			m := New(nodes, testTrunk, "0.0.1", 7).WithStackURL(url)
+			m.width, m.height = 100, 40
+			beforeCursor := m.cursor
+			var opened []string
+			m.openURL = func(url string) { opened = append(opened, url) }
+			for _, x := range []int{4, 9, 12} {
+				_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: x, Y: 4})
+			}
+			assert.Empty(t, opened, "words, spaces, and padding are not links")
+			updated, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 10, Y: 4})
+			result := updated.(Model)
+			assert.Equal(t, []string{url}, opened)
+			assert.Equal(t, beforeCursor, result.cursor)
+			assert.Empty(t, result.CheckoutBranch())
+			assert.Nil(t, cmd)
+		})
+	}
+}
+
+func TestOpenPRKeyWithStackLink(t *testing.T) {
+	nodes := makeNodes("feature")
+	nodes[0].PR = &ghapi.PRDetails{Number: 42, URL: "https://github.com/o/r/pull/42"}
+	m := New(nodes, testTrunk, "0.0.1", 7).WithStackURL("https://github.com/o/r/stack/7")
+	var opened string
+	m.openURL = func(url string) { opened = url }
+	_, cmd := m.Update(keyMsg("o"))
+	assert.Equal(t, nodes[0].PR.URL, opened)
+	assert.Nil(t, cmd)
+}
+
 func TestNew_CursorAtCurrentBranch(t *testing.T) {
 	nodes := makeNodes("b1", "b2", "b3")
 	nodes[1].IsCurrent = true
@@ -495,5 +531,6 @@ func TestBuildHeaderConfig_ShowsStackNumber(t *testing.T) {
 	m0 := New(makeNodes("b1", "b2"), testTrunk, "0.0.1", 0)
 	for _, line := range m0.buildHeaderConfig().InfoLines {
 		assert.NotContains(t, line.Label, "Stack #")
+		assert.Empty(t, line.URL)
 	}
 }

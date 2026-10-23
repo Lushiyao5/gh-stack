@@ -44,7 +44,10 @@ func (m Model) buildHeaderConfig() shared.HeaderConfig {
 
 	infoLines := make([]shared.HeaderInfoLine, 0, 3)
 	if m.stackNumber > 0 {
-		infoLines = append(infoLines, shared.HeaderInfoLine{Icon: "◆", Label: fmt.Sprintf("Stack #%d • %s", m.stackNumber, repo)})
+		infoLines = append(infoLines, shared.HeaderInfoLine{
+			Icon: "◆", Label: fmt.Sprintf("Stack #%d • %s", m.stackNumber, repo),
+			LinkLabel: fmt.Sprintf("#%d", m.stackNumber), URL: m.stackURL,
+		})
 	} else {
 		infoLines = append(infoLines, shared.HeaderInfoLine{Icon: "◆", Label: "Repo: " + repo})
 	}

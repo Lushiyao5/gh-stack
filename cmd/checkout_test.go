@@ -8,14 +8,91 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/github/gh-stack/internal/config"
 	"github.com/github/gh-stack/internal/git"
 	"github.com/github/gh-stack/internal/github"
 	"github.com/github/gh-stack/internal/stack"
+	"github.com/github/gh-stack/internal/tui/checkoutview"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCheckoutPickerStackLinks(t *testing.T) {
+	profile := lipgloss.DefaultRenderer().ColorProfile()
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("CLICOLOR_FORCE", "1")
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(profile)
+
+	for _, tt := range []struct {
+		name                       string
+		number                     int
+		empty, failed, missingRepo bool
+		force                      string
+		wantLink                   bool
+	}{
+		{name: "matched stacks", number: 7, force: "1", wantLink: true},
+		{name: "successful empty listing", number: 7, empty: true, force: "1"},
+		{name: "failed listing", number: 7, failed: true, force: "1", wantLink: true},
+		{name: "legacy ID match", force: "1", wantLink: true},
+		{name: "links disabled", number: 7, force: "0"},
+		{name: "missing repository", number: 7, missingRepo: true, force: "1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GH_STACK_HYPERLINKS", tt.force)
+			cfg := config.New()
+			setTestRepo(cfg)
+			cfg.RepoOverride.Host = "github.example.com"
+			if tt.missingRepo {
+				cfg.RepoOverride.Owner = ""
+			}
+			calls := 0
+			cfg.GitHubClientOverride = &github.MockClient{
+				ListStacksFn: func() ([]github.RemoteStack, error) {
+					calls++
+					if tt.failed {
+						return nil, fmt.Errorf("offline")
+					}
+					if tt.empty {
+						return nil, nil
+					}
+					return []github.RemoteStack{
+						{ID: 6154, Number: 7, PRDetails: []github.RemoteStackPR{linkPR(10, "tracked")}},
+						{ID: 808, Number: 8, PRDetails: []github.RemoteStackPR{linkPR(11, "remote")}},
+					}, nil
+				},
+				GetStackFn: func(int) (*github.RemoteStack, error) {
+					t.Fatal("formatting picker links must not add a lookup")
+					return nil, nil
+				},
+			}
+			sf := &stack.StackFile{Stacks: []stack.Stack{
+				{Branches: []stack.BranchRef{{Branch: "unsubmitted"}}},
+				{ID: "6154", Number: tt.number, Branches: []stack.BranchRef{{Branch: "tracked"}}},
+			}}
+			rows, _, links := gatherCheckoutRows(cfg, sf)
+			m := checkoutview.New(rows).WithNumberLinks(links)
+			sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+			output := sized.View()
+			if tt.wantLink {
+				assert.Contains(t, output, "\x1b]8;;https://github.example.com/o/r/stack/7\x1b\\7\x1b]8;;\x1b\\")
+			} else {
+				assert.NotContains(t, output, "\x1b]8")
+				assert.NotContains(t, output, "https://")
+			}
+			if !tt.empty && !tt.failed && tt.wantLink {
+				assert.Contains(t, output, "/stack/8")
+			}
+			assert.NotContains(t, output, "/stack/0")
+			assert.Equal(t, 1, calls)
+			assert.Equal(t, tt.number, sf.Stacks[1].Number, "presentation must not mutate tracking")
+		})
+	}
+}
 
 func TestCheckout_PrintPathRequiresTarget(t *testing.T) {
 	cfg, outR, errR := config.NewTestConfig()
@@ -47,6 +124,7 @@ func TestCheckout_PrintPathAmbiguousBranch(t *testing.T) {
 }
 
 func TestCheckout_RemotePrintPathDoesNotImportDuringRecovery(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	common, root, owner := t.TempDir(), t.TempDir(), t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(common, rebaseStateFile), []byte(`{"worktrees":{}}`), 0600))
 	restore := git.SetOps(&git.MockOps{
@@ -428,6 +506,7 @@ func TestCheckout_BranchNotFound(t *testing.T) {
 }
 
 func TestCheckout_RemoteBranchName_MultipleStacks(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "0")
 	gitDir := t.TempDir()
 	checkoutCalled := false
 	restore := git.SetOps(&git.MockOps{
@@ -443,6 +522,7 @@ func TestCheckout_RemoteBranchName_MultipleStacks(t *testing.T) {
 	require.NoError(t, stack.Save(gitDir, &stack.StackFile{SchemaVersion: 1, Stacks: []stack.Stack{}}))
 
 	cfg, outR, errR := config.NewTestConfig()
+	setTestRepo(cfg)
 	cfg.GitHubClientOverride = &github.MockClient{
 		ListStacksFn: func() ([]github.RemoteStack, error) {
 			return []github.RemoteStack{
@@ -471,7 +551,7 @@ func TestCheckout_RemoteBranchName_MultipleStacks(t *testing.T) {
 
 	assert.ErrorIs(t, err, ErrDisambiguate)
 	assert.False(t, checkoutCalled)
-	assert.Contains(t, output, `branch "feature" belongs to multiple stacks on GitHub (7, 8)`)
+	assert.Contains(t, output, `branch "feature" belongs to multiple stacks on GitHub (7 (https://github.com/o/r/stack/7), 8 (https://github.com/o/r/stack/8))`)
 	assert.Contains(t, output, "stack or PR number")
 }
 
@@ -663,6 +743,7 @@ func TestCheckout_NumericTarget_NewStack(t *testing.T) {
 }
 
 func TestCheckout_ByStackNumber(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	gitDir := t.TempDir()
 	var checkedOut string
 	var createdBranches []string
@@ -697,6 +778,7 @@ func TestCheckout_ByStackNumber(t *testing.T) {
 
 	var gotStackNumber int
 	cfg, outR, errR := config.NewTestConfig()
+	setTestRepo(cfg)
 	cfg.GitHubClientOverride = &github.MockClient{
 		GetStackFn: func(n int) (*github.RemoteStack, error) {
 			gotStackNumber = n
@@ -716,6 +798,8 @@ func TestCheckout_ByStackNumber(t *testing.T) {
 	}
 
 	err := runCheckout(cfg, &checkoutOptions{target: "7"})
+	require.NoError(t, err)
+	require.NoError(t, runCheckout(cfg, &checkoutOptions{target: "7"}))
 	output := collectOutput(cfg, outR, errR)
 
 	require.NoError(t, err)
@@ -723,6 +807,10 @@ func TestCheckout_ByStackNumber(t *testing.T) {
 	// The top-most (last) branch of the stack is checked out.
 	assert.Equal(t, "feat-3", checkedOut)
 	assert.Contains(t, output, "Imported stack with 3 branches")
+	link := "\x1b]8;;https://github.com/o/r/stack/7\x1b\\#7\x1b]8;;\x1b\\"
+	assert.Contains(t, output, "from GitHub (stack "+link+")")
+	assert.Contains(t, output, "Local stack matches remote (stack "+link+")")
+	assert.NotContains(t, output, "/stack/42")
 
 	// Verify the stack was imported with both its internal id and stack number.
 	sf, loadErr := stack.Load(gitDir)

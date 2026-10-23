@@ -16,6 +16,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestViewStackLinks(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
+	for _, render := range []struct {
+		name string
+		fn   func(*config.Config, *stack.Stack, string) error
+	}{
+		{"short", viewShort},
+		{"static", viewFullStatic},
+	} {
+		t.Run(render.name, func(t *testing.T) {
+			cfg, outR, errR := config.NewTestConfig()
+			cfg.NonInteractive = true
+			setTestRepo(cfg)
+			cfg.GitHubClientOverride = &github.MockClient{}
+			s := &stack.Stack{ID: "6154", Number: 7, Trunk: stack.BranchRef{Branch: "main"}}
+			require.NoError(t, render.fn(cfg, s, "main"))
+			output, _ := commandOutput(t, cfg, outR, errR)
+			assert.Contains(t, output, "Stack \x1b]8;;https://github.com/o/r/stack/7\x1b\\#7\x1b]8;;\x1b\\")
+			assert.NotContains(t, output, "/stack/6154")
+		})
+	}
+}
+
 func TestTimeAgo(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -41,6 +64,7 @@ func TestTimeAgo(t *testing.T) {
 }
 
 func TestViewJSON(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	original := git.CurrentOps()
 	t.Cleanup(func() { assert.Same(t, original, git.CurrentOps()) })
 	restore := git.SetOps(&git.MockOps{
@@ -123,12 +147,18 @@ func TestViewJSON(t *testing.T) {
 			cfg, outR, _ := config.NewTestConfig()
 			defer outR.Close()
 
+			tt.stack.Number = 7
 			err := viewJSON(cfg, tt.stack, tt.currentBranch)
 			require.NoError(t, err)
 			cfg.Out.Close()
 
 			raw, err := io.ReadAll(outR)
 			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(raw, &fields))
+			assert.Len(t, fields, 3)
+			assert.NotContains(t, string(raw), "\\u001b")
+			assert.NotContains(t, string(raw), "/stack/")
 
 			var got viewJSONOutput
 			err = json.Unmarshal(raw, &got)

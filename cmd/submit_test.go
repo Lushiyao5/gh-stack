@@ -843,6 +843,7 @@ func TestSyncStack_ExistingStack_UpdateFails(t *testing.T) {
 }
 
 func TestSyncStack_ExistingStack_Update404(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "0")
 	s := &stack.Stack{
 		ID:     "99",
 		Number: 99,
@@ -872,6 +873,7 @@ func TestSyncStack_ExistingStack_Update404(t *testing.T) {
 	}
 
 	cfg, _, errR := config.NewTestConfig()
+	setTestRepo(cfg)
 	syncStack(cfg, mock, s)
 
 	cfg.Err.Close()
@@ -881,6 +883,8 @@ func TestSyncStack_ExistingStack_Update404(t *testing.T) {
 	assert.True(t, createCalled, "should fall through to CreateStack after 404")
 	assert.Equal(t, "55", s.ID, "should set new stack ID from create response")
 	assert.Contains(t, output, "Stack created on GitHub with 2 PRs")
+	assert.Contains(t, output, "#55 (https://github.com/o/r/stack/55)")
+	assert.NotContains(t, output, "/stack/99")
 }
 
 func TestSyncStack_AlreadyStacked_OurStack(t *testing.T) {
@@ -1275,6 +1279,7 @@ func TestSyncStack_SkippedForSinglePR(t *testing.T) {
 }
 
 func TestSyncStack_MergedMembership(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "1")
 	for _, tc := range []struct {
 		name       string
 		tracked    bool
@@ -1318,15 +1323,20 @@ func TestSyncStack_MergedMembership(t *testing.T) {
 				},
 			}
 			cfg, outR, errR := config.NewTestConfig()
+			setTestRepo(cfg)
 			assert.True(t, syncStack(cfg, mock, s))
-			commandOutput(t, cfg, outR, errR)
+			_, output := commandOutput(t, cfg, outR, errR)
 			assert.Equal(t, tc.wantCreate, created)
 			assert.Equal(t, tc.wantAdd, added)
 			if tc.wantCreate != nil {
 				assert.Equal(t, "88", s.ID)
+				assert.Contains(t, output, "\x1b]8;;https://github.com/o/r/stack/8\x1b\\#8\x1b]8;;\x1b\\")
 			} else {
 				assert.Equal(t, "77", s.ID)
+				assert.Contains(t, output, "\x1b]8;;https://github.com/o/r/stack/7\x1b\\#7\x1b]8;;\x1b\\")
 			}
+			assert.NotContains(t, output, "/stack/77")
+			assert.NotContains(t, output, "/stack/88")
 			assert.Equal(t, []string{"b1", "b2", "b3"}, s.BranchNames())
 		})
 	}

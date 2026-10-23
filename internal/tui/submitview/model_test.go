@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	ghapi "github.com/github/gh-stack/internal/github"
 	"github.com/github/gh-stack/internal/stack"
 	"github.com/github/gh-stack/internal/tui/stackview"
@@ -329,8 +330,12 @@ func TestHeaderConfig_StackNumberInRepoLine(t *testing.T) {
 		RepoLabel:   "myorg/myrepo",
 		Version:     "1.0.0",
 		StackNumber: 7,
+		StackURL:    "https://github.com/myorg/myrepo/stack/7",
 	})
-	assert.Equal(t, "Stack #7 • myorg/myrepo", m.buildHeaderConfig().InfoLines[0].Label)
+	info := m.buildHeaderConfig().InfoLines[0]
+	assert.Equal(t, "Stack #7 • myorg/myrepo", info.Label)
+	assert.Equal(t, "#7", info.LinkLabel)
+	assert.Equal(t, "https://github.com/myorg/myrepo/stack/7", info.URL)
 
 	// Without a stack number, the first line is just the repo.
 	assert.Equal(t, "Repo: myorg/myrepo", testModel(t, newNodes()).buildHeaderConfig().InfoLines[0].Label)
@@ -374,6 +379,82 @@ func TestView_EmptyWhenNoSize(t *testing.T) {
 }
 
 // --- mouse ---
+
+func TestLeftPanel_StackLinkClipping(t *testing.T) {
+	m := testModel(t, newNodes())
+	m.width = 70
+	m.stackNumber = int(^uint(0) >> 1)
+	m.stackURL = "https://github.com/o/r/stack/7"
+	leftW, _ := m.panelWidths()
+	header := m.buildLeftRows(leftW - 2)[0].text
+	assert.LessOrEqual(t, lipgloss.Width(header), leftW-2)
+	assert.NotContains(t, header, m.stackURL)
+	last := 1 + lipgloss.Width(truncateVisible(m.stackHeading(), leftW-3))
+	assert.True(t, m.leftStackLinkHit(last, m.panelTopRow()))
+	assert.False(t, m.leftStackLinkHit(last+1, m.panelTopRow()))
+	assert.False(t, m.leftStackLinkHit(leftW-1, m.panelTopRow()))
+	m.height, m.leftScroll = 26, 1
+	assert.False(t, m.leftStackLinkHit(8, m.panelTopRow()), "scrolled-out headings are not clickable")
+	m.leftScroll, m.stackURL = 0, ""
+	assert.False(t, m.leftStackLinkHit(8, m.panelTopRow()))
+	m.stackNumber, m.stackURL = 0, "https://github.com/o/r/stack/7"
+	assert.False(t, m.leftStackLinkHit(8, m.panelTopRow()))
+}
+
+func TestSidebarLinkAfterResizeWithClosedPR(t *testing.T) {
+	m := testModel(t, append(newNodes(), newNode("closed", StateClosed)))
+	m.stackNumber, m.stackURL = 7, "https://github.com/o/r/stack/7"
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 26})
+	m = updated.(Model)
+	m.scrollLeft(1000)
+	require.Positive(t, m.leftScroll)
+
+	leftW, _ := m.panelWidths()
+	rows := m.buildLeftRows(leftW - 2)
+	// The banner leaves just the heading scrolled out after this resize.
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: len(rows) + m.headerHeight() + 3})
+	m = updated.(Model)
+	assert.NotContains(t, stripANSI(m.View()), "STACK #7")
+	var opened []string
+	m.openURL = func(url string) { opened = append(opened, url) }
+	_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 8, Y: m.panelTopRow()})
+	assert.Empty(t, opened, "the first visible sidebar row is blank, not a link")
+}
+
+func TestMouse_StackLinks(t *testing.T) {
+	t.Setenv("GH_STACK_HYPERLINKS", "0")
+	const url = "https://github.example.com/o/r/stack/7"
+	m := testModel(t, newNodes())
+	m.stackNumber, m.stackURL = 7, url
+	m.titleArea.SetValue("unsaved title")
+	m.descArea.SetValue("unsaved description")
+	beforeCursor, beforeField := m.cursor, m.focusedField
+	var opened []string
+	m.openURL = func(url string) { opened = append(opened, url) }
+	click := func(x, y int) {
+		updated, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: x, Y: y})
+		m = updated.(Model)
+		assert.Nil(t, cmd)
+	}
+	for _, point := range [][2]int{{4, 4}, {9, 4}, {12, 4}, {2, m.panelTopRow()}, {7, m.panelTopRow()}, {10, m.panelTopRow()}} {
+		click(point[0], point[1])
+	}
+	assert.Empty(t, opened, "words, spaces, and adjacent text are not links")
+	click(10, 4)
+	click(8, m.panelTopRow())
+	assert.Equal(t, []string{url, url}, opened)
+	assert.Equal(t, beforeCursor, m.cursor)
+	assert.Equal(t, beforeField, m.focusedField)
+	assert.Equal(t, "unsaved title", m.titleArea.Value())
+	assert.Equal(t, "unsaved description", m.descArea.Value())
+	assert.False(t, m.SubmitRequested())
+	assert.False(t, m.Cancelled())
+	m.showHelp = true
+	click(10, 4)
+	m.confirmingQuit = true
+	click(8, m.panelTopRow())
+	assert.Len(t, opened, 2, "overlays block the underlying links")
+}
 
 func TestMouse_ClickBranchFocuses(t *testing.T) {
 	m := testModel(t, newNodes())

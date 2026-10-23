@@ -292,7 +292,7 @@ func checkoutRemoteStackByBranch(cfg *config.Config, sf *stack.StackFile, gitDir
 	if len(matches) > 1 {
 		stackNumbers := make([]string, len(matches))
 		for i, match := range matches {
-			stackNumbers[i] = strconv.Itoa(match.Number)
+			stackNumbers[i] = cfg.Link(strconv.Itoa(match.Number), cfg.StackURL(match.Number))
 		}
 		cfg.Errorf("branch %q belongs to multiple stacks on GitHub (%s)",
 			branch, strings.Join(stackNumbers, ", "))
@@ -384,9 +384,10 @@ func checkoutStackByNumber(cfg *config.Config, sf *stack.StackFile, gitDir strin
 	}
 
 	remoteStack, err := client.GetStack(stackNumber)
-	if err != nil || remoteStack == nil || len(remoteStack.PullRequests) == 0 {
-		// No such stack, stacks unavailable, or a transient failure — let the
-		// caller try the number as a PR number or branch name.
+	if err != nil {
+		return nil, "", errors.Join(errStackNumberNotFound, err)
+	}
+	if remoteStack == nil || len(remoteStack.PullRequests) == 0 {
 		return nil, "", errStackNumberNotFound
 	}
 
@@ -474,7 +475,7 @@ func reconcileAndImportRemoteStack(cfg *config.Config, client github.ClientOps, 
 			if err := stack.Save(gitDir, sf); err != nil {
 				return nil, "", stackSaveError(cfg, err)
 			}
-			cfg.Successf("Local stack matches remote%s", stackLabel(remoteStack.Number))
+			cfg.Successf("Local stack matches remote%s", linkedStackLabel(cfg, remoteStack.Number))
 			return localStack, targetBranch, nil
 		}
 
@@ -712,7 +713,7 @@ func importRemoteStack(
 	// Update base SHAs from actual local refs
 	updateBaseSHAs(s)
 
-	cfg.Successf("Imported stack with %d branches from GitHub%s", len(prs), stackLabel(remoteStackNumber))
+	cfg.Successf("Imported stack with %d branches from GitHub%s", len(prs), linkedStackLabel(cfg, remoteStackNumber))
 	return s, nil
 }
 
@@ -748,7 +749,7 @@ func interactiveCheckout(cfg *config.Config, sf *stack.StackFile, gitDir string)
 		return nil, "", fmt.Errorf("no target specified; provide a branch name or PR number, or run interactively to select a stack")
 	}
 
-	rows, remoteStacks := gatherCheckoutRows(cfg, sf)
+	rows, remoteStacks, links := gatherCheckoutRows(cfg, sf)
 	if currentBranch, branchErr := git.CurrentBranch(); branchErr == nil {
 		stackNumber, confirmed, confirmErr := offerRemoteStackForBranch(cfg, sf, remoteStacks, currentBranch)
 		if confirmErr != nil {
@@ -772,7 +773,7 @@ func interactiveCheckout(cfg *config.Config, sf *stack.StackFile, gitDir string)
 		return nil, "", nil
 	}
 
-	selected, ok, err := launchCheckoutPicker(rows)
+	selected, ok, err := launchCheckoutPicker(rows, links)
 	if err != nil {
 		return nil, "", err
 	}
@@ -789,14 +790,29 @@ func interactiveCheckout(cfg *config.Config, sf *stack.StackFile, gitDir string)
 // with the local stacks into the picker's rows. Any GitHub failure (stacks not
 // enabled for the repo, no auth, network error) gracefully degrades to a
 // local-only list.
-func gatherCheckoutRows(cfg *config.Config, sf *stack.StackFile) ([]checkoutview.StackRow, []github.RemoteStack) {
+func gatherCheckoutRows(cfg *config.Config, sf *stack.StackFile) ([]checkoutview.StackRow, []github.RemoteStack, map[int]string) {
 	var remote []github.RemoteStack
+	var remoteNumbers map[int]bool // nil means the remote listing was unavailable
 	if client, err := cfg.GitHubClient(); err == nil {
 		if stacks, err := client.ListStacks(); err == nil {
 			remote = stacks
+			remoteNumbers = make(map[int]bool, len(stacks))
+			for _, s := range stacks {
+				remoteNumbers[s.Number] = true
+			}
 		}
 	}
-	return checkoutview.BuildRows(sf.Stacks, remote), remote
+	rows := checkoutview.BuildRows(sf.Stacks, remote)
+	links := make(map[int]string)
+	if repo, err := cfg.Repo(); err == nil && repo.Owner != "" && repo.Name != "" {
+		for _, row := range rows {
+			if row.Number > 0 && (remoteNumbers == nil || remoteNumbers[row.Number]) {
+				url := github.StackURL(repo.Host, repo.Owner, repo.Name, row.Number)
+				links[row.Number] = cfg.TerminalLink(row.NumberDisplay(), url)
+			}
+		}
+	}
+	return rows, remote, links
 }
 
 // offerRemoteStackForBranch asks to check out the unique active remote stack
@@ -814,7 +830,8 @@ func offerRemoteStackForBranch(cfg *config.Config, sf *stack.StackFile, remote [
 	}
 
 	stackNumber := matches[0].Number
-	prompt := fmt.Sprintf("Found stack #%d that includes branch %q. Check out stack #%d?", stackNumber, branch, stackNumber)
+	cfg.Infof("Found stack %s that includes branch %q.", cfg.StackLink(stackNumber), branch)
+	prompt := fmt.Sprintf("Check out stack #%d?", stackNumber)
 	confirmed, err := confirmRemoteStackCheckout(cfg, prompt)
 	if err != nil {
 		if errors.Is(err, errInterrupt) {
@@ -886,7 +903,11 @@ func resolveCheckoutSelection(cfg *config.Config, sf *stack.StackFile, gitDir st
 	s, targetBranch, err := checkoutStackByNumber(cfg, sf, gitDir, selected.Number)
 	if err != nil {
 		if errors.Is(err, errStackNumberNotFound) {
-			cfg.Errorf("stack #%d could not be loaded from GitHub", selected.Number)
+			label := fmt.Sprintf("#%d", selected.Number)
+			if !isNotFound(err) {
+				label = cfg.StackLink(selected.Number)
+			}
+			cfg.Errorf("stack %s could not be loaded from GitHub", label)
 			return nil, "", ErrAPIFailure
 		}
 		return nil, "", err
@@ -899,8 +920,8 @@ func resolveCheckoutSelection(cfg *config.Config, sf *stack.StackFile, gitDir st
 // picker occupies only a few lines and leaves the surrounding terminal output
 // intact. Mouse motion is intentionally not enabled so the search field never
 // receives stray mouse bytes.
-func launchCheckoutPicker(rows []checkoutview.StackRow) (checkoutview.StackRow, bool, error) {
-	p := tea.NewProgram(checkoutview.New(rows))
+func launchCheckoutPicker(rows []checkoutview.StackRow, links map[int]string) (checkoutview.StackRow, bool, error) {
+	p := tea.NewProgram(checkoutview.New(rows).WithNumberLinks(links))
 	finalModel, err := p.Run()
 	if err != nil {
 		return checkoutview.StackRow{}, false, fmt.Errorf("running stack picker: %w", err)
