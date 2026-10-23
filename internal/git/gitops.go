@@ -286,7 +286,22 @@ func (d *defaultOps) Push(remote string, branches []string, force, atomic bool) 
 	for _, b := range branches {
 		args = append(args, fmt.Sprintf("refs/heads/%s:refs/heads/%s", b, b))
 	}
-	return d.runSilent(args...)
+	if !force {
+		return d.runSilent(args...)
+	}
+	// Send the "pull.stacked" push option on force pushes, falling back to a
+	// plain push for remotes that don't support push options.
+	withOpt := append([]string{"-c", "push.pushOption=pull.stacked", "push"}, args[1:]...)
+	cmd, err := d.command(withOpt...)
+	if err != nil {
+		return err
+	}
+	cmd.Env = append(cmd.Environ(), "LC_ALL=C")
+	err = cmd.Run()
+	if err != nil && strings.Contains(err.Error(), "does not support push options") {
+		return d.runSilent(args...)
+	}
+	return err
 }
 
 // ResolveRemote determines the remote for pushing a branch. It checks git
