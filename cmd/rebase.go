@@ -250,10 +250,8 @@ func runRebase(cfg *config.Config, opts *rebaseOptions) error {
 	if startIdx > 0 {
 		prev := s.Branches[startIdx-1]
 		if prev.IsMerged() {
-			if sha, ok := originalRefs[prev.Branch]; ok {
-				needsOnto = true
-				ontoOldBase = sha
-			}
+			needsOnto = true
+			ontoOldBase = originalRefs[prev.Branch]
 		}
 	}
 
@@ -456,7 +454,8 @@ func continueRebase(cfg *config.Config, gitDir string) error {
 			NeedsOnto:                 state.UseOnto,
 			OntoOldBase:               state.OntoOldBase,
 			CommitterDateIsAuthorDate: state.CommitterDateIsAuthorDate,
-			TrunkRef:                  trunkBase,
+			TrunkRef:                  trunkRef,
+			TrunkSHA:                  state.TrunkSHA,
 		})
 
 		if result.Err != nil {
