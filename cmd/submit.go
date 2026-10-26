@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,9 +23,10 @@ import (
 )
 
 type submitOptions struct {
-	auto   bool
-	open   bool
-	remote string
+	auto     bool
+	open     bool
+	remote   string
+	noAtomic bool
 }
 
 func SubmitCmd(cfg *config.Config) *cobra.Command {
@@ -46,10 +48,12 @@ after deleting the stack) and you deselect every new PR, press Ctrl+B (or click
 the "STACK N PRs" button) to link the existing open PRs into a stack.
 
 This command performs several steps:
-  1. Pushes all branches to the remote
+  1. Pushes all active branches to the remote atomically
   2. Creates new PRs for the included branches
   3. Updates base branches for existing PRs
   4. Creates or updates the stack on GitHub
+
+Use --no-atomic to allow partial branch updates. PR updates are not atomic.
 
 In the editor, new PRs default to ready for review; switch any to draft with the
 "CREATE AS" toggle. With --auto, new PRs are created as drafts unless you pass
@@ -70,6 +74,7 @@ In the editor, new PRs default to ready for review; switch any to draft with the
 	cmd.Flags().BoolVar(&opts.auto, "auto", false, "Use auto-generated PR titles without prompting")
 	cmd.Flags().BoolVar(&opts.open, "open", false, "Mark new and existing PRs as ready for review")
 	cmd.Flags().StringVar(&opts.remote, "remote", "", "Remote to push to (defaults to auto-detected remote)")
+	cmd.Flags().BoolVar(&opts.noAtomic, "no-atomic", os.Getenv("GH_STACK_NO_ATOMIC") != "", "Disable atomic pushes (also set by GH_STACK_NO_ATOMIC)")
 
 	return cmd
 }
@@ -237,21 +242,26 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 		drafts = collected
 	}
 
-	// Push each branch and create/update its PR in stack order (bottom to top).
-	// Sequential pushing ensures each branch's base is up-to-date on the
-	// remote before the next branch is pushed, preventing race conditions.
-	cfg.Printf("Pushing to %s...", remote)
+	if pendingModify {
+		if err := prepareReorderedPRs(cfg, client, s); err != nil {
+			cfg.Errorf("failed to prepare reordered PRs: %s", err)
+			return ErrSilent
+		}
+	}
+
+	if len(activeBranches) > 0 {
+		cfg.Printf("Pushing to %s...", remote)
+		if err := git.Push(remote, activeBranches, true, !opts.noAtomic); err != nil {
+			cfg.Errorf("failed to push: %s", err)
+			return ErrSilent
+		}
+	}
+
 	allPRsSubmitted := len(queued) == 0
 	submittedPRs := make(map[string]int, len(activeBranches))
 	for i, b := range s.Branches {
 		if s.Branches[i].IsMerged() || s.Branches[i].IsQueued() {
 			continue
-		}
-
-		// Push this branch
-		if err := git.Push(remote, []string{b.Branch}, true, false); err != nil {
-			cfg.Errorf("failed to push %s: %s", b.Branch, err)
-			return ErrSilent
 		}
 
 		// Find or create PR, and fix base if needed
@@ -301,6 +311,35 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	}
 
 	cfg.Successf("Pushed and synced %d branches", len(s.ActiveBranches()))
+	return nil
+}
+
+// Reversed PR relationships can cause indirect merges when the new heads are
+// pushed. Use the unchanged trunk until ensurePR restores the intended bases.
+func prepareReorderedPRs(cfg *config.Config, client github.ClientOps, s *stack.Stack) error {
+	for i, b := range s.Branches {
+		if b.IsSkipped() {
+			continue
+		}
+		pr, err := client.FindPRForBranch(b.Branch)
+		if err != nil {
+			return fmt.Errorf("looking up PR for %s: %w", b.Branch, err)
+		}
+		if pr == nil || s.IndexOf(pr.BaseRefName) <= i {
+			continue
+		}
+		if pr.IsAutoMergeEnabled() {
+			if err := client.DisableAutoMerge(pr.ID); err != nil {
+				return fmt.Errorf("disabling auto-merge for PR #%d: %w", pr.Number, err)
+			}
+			cfg.Warningf("Disabled auto-merge for PR %s (incompatible with stacked PRs)",
+				cfg.PRLink(pr.Number, pr.URL))
+		}
+		if err := client.UpdatePRBase(pr.Number, s.Trunk.Branch); err != nil {
+			return fmt.Errorf("temporarily setting base of PR #%d to %s: %w", pr.Number, s.Trunk.Branch, err)
+		}
+		cfg.Successf("Temporarily set base of PR %s to %s", cfg.PRLink(pr.Number, pr.URL), s.Trunk.Branch)
+	}
 	return nil
 }
 

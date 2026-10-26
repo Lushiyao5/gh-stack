@@ -76,6 +76,7 @@ func newSyncMock(tmpDir string, currentBranch string) *git.MockOps {
 // TestSync_TrunkAlreadyUpToDate verifies that when trunk and origin/trunk have
 // the same SHA, no rebase occurs and push is normal (not force).
 func TestSync_TrunkAlreadyUpToDate(t *testing.T) {
+	t.Setenv("GH_STACK_NO_ATOMIC", "")
 	s := stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{
@@ -134,6 +135,7 @@ func TestSync_TrunkAlreadyUpToDate(t *testing.T) {
 	// Push should happen without force
 	require.Len(t, pushCalls, 1)
 	assert.False(t, pushCalls[0].force, "push should not use force when no rebase occurred")
+	assert.True(t, pushCalls[0].atomic)
 }
 
 // TestSync_TrunkUpToDate_StackStale verifies that when trunk is already up to
@@ -641,6 +643,7 @@ func TestSync_NoRebaseWhenTrunkDidntMove(t *testing.T) {
 // TestSync_PushForceFlagDependsOnRebase verifies that the force flag on Push
 // correlates with whether a rebase actually happened.
 func TestSync_PushForceFlagDependsOnRebase(t *testing.T) {
+	t.Setenv("GH_STACK_NO_ATOMIC", "")
 	tests := []struct {
 		name          string
 		trunkMoved    bool
@@ -710,6 +713,7 @@ func TestSync_PushForceFlagDependsOnRebase(t *testing.T) {
 			require.Len(t, pushCalls, 1, "exactly one push call expected")
 			assert.Equal(t, tt.expectedForce, pushCalls[0].force,
 				"force flag should be %v when trunkMoved=%v", tt.expectedForce, tt.trunkMoved)
+			assert.True(t, pushCalls[0].atomic)
 		})
 	}
 }

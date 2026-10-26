@@ -1679,6 +1679,7 @@ func TestLink_UpdateDeletedStack_FallsBackToCreate(t *testing.T) {
 }
 
 func TestLink_PushesBranchesBeforeResolution(t *testing.T) {
+	t.Setenv("GH_STACK_NO_ATOMIC", "")
 	var pushedBranches []string
 	var pushedRemote string
 
@@ -1689,6 +1690,8 @@ func TestLink_PushesBranchesBeforeResolution(t *testing.T) {
 		PushFn: func(remote string, branches []string, force, atomic bool) error {
 			pushedRemote = remote
 			pushedBranches = branches
+			assert.False(t, force)
+			assert.True(t, atomic)
 			return nil
 		},
 	})

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -93,6 +94,7 @@ func newSubmitMock(tmpDir string, currentBranch string) *git.MockOps {
 }
 
 func TestSubmit_CreatesPRsAndStack(t *testing.T) {
+	t.Setenv("GH_STACK_NO_ATOMIC", "")
 	s := stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{
@@ -126,6 +128,7 @@ func TestSubmit_CreatesPRsAndStack(t *testing.T) {
 			return nil, nil // No existing PR
 		},
 		CreatePRFn: func(base, head, title, body string, draft bool) (*github.PullRequest, error) {
+			require.Len(t, pushCalls, 1, "all branches must be pushed before creating PRs")
 			createdPRs = append(createdPRs, head)
 			prCounter++
 			return &github.PullRequest{
@@ -151,11 +154,12 @@ func TestSubmit_CreatesPRsAndStack(t *testing.T) {
 
 	assert.NoError(t, err)
 
-	// Branches should be pushed (sequentially, one per branch)
-	require.Len(t, pushCalls, 2)
+	// Branches should be pushed together before creating PRs.
+	require.Len(t, pushCalls, 1)
 	assert.Equal(t, "origin", pushCalls[0].remote)
-	assert.Equal(t, []string{"b1"}, pushCalls[0].branches)
-	assert.Equal(t, []string{"b2"}, pushCalls[1].branches)
+	assert.Equal(t, []string{"b1", "b2"}, pushCalls[0].branches)
+	assert.True(t, pushCalls[0].force)
+	assert.True(t, pushCalls[0].atomic)
 
 	// PRs should be created
 	assert.Equal(t, []string{"b1", "b2"}, createdPRs)
@@ -331,7 +335,12 @@ func TestSubmit_PushFailure(t *testing.T) {
 	defer restore()
 
 	cfg, _, errR := config.NewTestConfig()
-	cfg.GitHubClientOverride = &github.MockClient{}
+	cfg.GitHubClientOverride = &github.MockClient{
+		CreatePRFn: func(string, string, string, string, bool) (*github.PullRequest, error) {
+			t.Fatal("must not create PRs after a failed push")
+			return nil, nil
+		},
+	}
 	cmd := SubmitCmd(cfg)
 	cmd.SetArgs([]string{"--auto"})
 	cmd.SetOut(io.Discard)
@@ -489,9 +498,8 @@ func TestSubmit_ForksWhenRemoteStackFullyMerged(t *testing.T) {
 			require.NoError(t, err)
 
 			// Only the new branches are pushed; merged ones are left behind.
-			require.Len(t, pushCalls, 2)
-			assert.Equal(t, []string{"b3"}, pushCalls[0].branches)
-			assert.Equal(t, []string{"b4"}, pushCalls[1].branches)
+			require.Len(t, pushCalls, 1)
+			assert.Equal(t, []string{"b3", "b4"}, pushCalls[0].branches)
 
 			// Fork messaging.
 			assert.Contains(t, output, "Every PR in this stack has already been merged")
@@ -1869,16 +1877,20 @@ func newPendingSubmitState(priorStackID string) *modify.StateFile {
 
 func TestSubmit_PendingModifyCompletion(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		branches     int
-		newPR        bool
-		failure      string
-		priorDeleted bool
-		mergedBase   bool
-		retry        bool
-		mergeOnRetry bool
+		name              string
+		branches          int
+		newPR             bool
+		failure           string
+		priorDeleted      bool
+		mergedBase        bool
+		retry             bool
+		mergeOnRetry      bool
+		mergeAfterUnstack bool
+		reorder           bool
+		noAtomic          bool
 	}{
 		{name: "one existing PR", branches: 1},
+		{name: "last PR merged while unstacking", branches: 1, mergeAfterUnstack: true},
 		{name: "one new PR", branches: 1, newPR: true},
 		{name: "retry after old stack deletion", branches: 1, newPR: true, priorDeleted: true},
 		{name: "one PR failed push", branches: 1, failure: "push"},
@@ -1892,6 +1904,10 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 		{name: "one PR lost during final refresh", branches: 1, failure: "refresh"},
 		{name: "one PR after partial unstack", branches: 1, mergedBase: true},
 		{name: "multiple PRs complete", branches: 3},
+		{name: "reordered PRs", branches: 3, reorder: true},
+		{name: "reordered PRs non-atomic", branches: 3, reorder: true, noAtomic: true},
+		{name: "reordered PRs preparation fails", branches: 3, reorder: true, failure: "prepare", retry: true},
+		{name: "reordered PRs push fails", branches: 3, reorder: true, failure: "push", retry: true},
 		{name: "multiple PRs after partial unstack", branches: 3, mergedBase: true},
 		{name: "retry push after partial unstack", branches: 3, mergedBase: true, failure: "push", retry: true},
 		{name: "released PR merged before retry", branches: 3, mergedBase: true, failure: "push", retry: true, mergeOnRetry: true},
@@ -1924,14 +1940,14 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 					if i > 0 {
 						base = fmt.Sprintf("b%d", i)
 					}
-					if name == target {
+					if name == target && !tc.reorder {
 						base = "removed"
 					}
 					prs[name] = &github.PullRequest{
 						Number: 10 + i, ID: fmt.Sprintf("PR_%d", 10+i), State: "OPEN",
 						HeadRefName: name, BaseRefName: base,
 					}
-					if tc.failure == "auto-merge" && name == target {
+					if (tc.failure == "auto-merge" || tc.reorder) && name == target {
 						prs[name].AutoMergeRequest = &github.AutoMergeRequest{EnabledAt: "2026-09-29T00:00:00Z"}
 					}
 					prs[name].IsDraft = tc.failure == "ready" && name == target
@@ -1939,6 +1955,9 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 					oldNumbers = append(oldNumbers, 10+i)
 				}
 				s.Branches = append(s.Branches, br)
+			}
+			if tc.reorder {
+				s.Branches[1], s.Branches[2] = s.Branches[2], s.Branches[1]
 			}
 			writeStackFile(t, dir, s)
 			pending := newPendingSubmitState("42")
@@ -1949,9 +1968,14 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 			saveModifyState(t, dir, pending)
 			mock := newSubmitMock(dir, "b1")
 			var pushes []string
-			mock.PushFn = func(_ string, branches []string, _, _ bool) error {
-				pushes = append(pushes, branches[0])
-				if tc.failure == "push" && branches[0] == target {
+			mock.PushFn = func(_ string, branches []string, _, atomic bool) error {
+				require.NotEmpty(t, branches)
+				if tc.reorder {
+					assert.Equal(t, "main", prs[target].BaseRefName, "detach the reversed PR base before pushing")
+					assert.Equal(t, !tc.noAtomic, atomic)
+				}
+				pushes = append(pushes, branches...)
+				if tc.failure == "push" && slices.Contains(branches, target) {
 					return assert.AnError
 				}
 				return nil
@@ -2017,6 +2041,10 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 					require.Equal(t, 7, number)
 					unstackCalls++
 					oldDeleted = true
+					if tc.mergeAfterUnstack {
+						prs[target].Merged = true
+						prs[target].State = "MERGED"
+					}
 					if tc.mergedBase {
 						return &github.RemoteStack{ID: 42, Number: 7, PullRequests: []int{9}}, false, nil
 					}
@@ -2036,11 +2064,20 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 				},
 				UpdatePRBaseFn: func(number int, base string) error {
 					baseUpdates++
-					if tc.failure == "base" {
+					if tc.failure == "base" || tc.failure == "prepare" {
 						return assert.AnError
 					}
-					require.Equal(t, prs[target].Number, number)
-					prs[target].BaseRefName = base
+					if !tc.reorder {
+						require.Equal(t, prs[target].Number, number)
+					}
+					for _, pr := range prs {
+						if pr.Number == number {
+							if tc.reorder {
+								assert.False(t, pr.IsAutoMergeEnabled(), "disable auto-merge before changing bases")
+							}
+							pr.BaseRefName = base
+						}
+					}
 					if tc.failure == "save" {
 						var err error
 						catalogLock, err = stack.Lock(dir)
@@ -2048,7 +2085,14 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 					}
 					return nil
 				},
-				DisableAutoMergeFn:     func(string) error { return assert.AnError },
+				DisableAutoMergeFn: func(id string) error {
+					if tc.failure == "auto-merge" {
+						return assert.AnError
+					}
+					require.Equal(t, prs[target].ID, id)
+					prs[target].AutoMergeRequest = nil
+					return nil
+				},
 				MarkPRReadyForReviewFn: func(string) error { return assert.AnError },
 				CreateStackFn: func(numbers []int) (*github.RemoteStack, error) {
 					require.GreaterOrEqual(t, len(numbers), 2)
@@ -2063,7 +2107,7 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 			cfg, outR, errR := config.NewTestConfig()
 			cfg.GitHubClientOverride = client
 
-			err := runSubmit(cfg, &submitOptions{auto: true, open: tc.failure == "ready"})
+			err := runSubmit(cfg, &submitOptions{auto: true, open: tc.failure == "ready", noAtomic: tc.noAtomic})
 
 			_, output := commandOutput(t, cfg, outR, errR)
 			if tc.failure != "" {
@@ -2076,10 +2120,18 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 				assert.NotContains(t, output, "Stack recreated")
 				assert.NotContains(t, output, "Changes from modify submitted")
 				assert.Nil(t, replacement, "an incomplete modification must not create a partial replacement stack")
+				if tc.failure == "prepare" {
+					assert.Empty(t, pushes, "do not push unless all reversed bases were detached")
+				}
 			} else {
 				require.NoError(t, err, output)
 				assert.NoFileExists(t, modify.StatePath(dir))
-				assert.Len(t, pushes, tc.branches)
+				if tc.mergeAfterUnstack {
+					assert.Empty(t, pushes)
+					assert.Zero(t, baseUpdates)
+				} else {
+					assert.Len(t, pushes, tc.branches)
+				}
 				saved, loadErr := stack.Load(dir)
 				require.NoError(t, loadErr)
 				assert.Equal(t, s.BranchNames(), saved.Stacks[0].BranchNames())
@@ -2094,7 +2146,9 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 				assert.Contains(t, output, "Changes from modify submitted")
 				if tc.newPR {
 					assert.Equal(t, 1, createdPRs)
-				} else {
+				} else if tc.reorder {
+					assert.Equal(t, 3, baseUpdates)
+				} else if !tc.mergeAfterUnstack {
 					assert.Equal(t, 1, baseUpdates)
 				}
 			}
@@ -2110,7 +2164,7 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 				pushStart := len(pushes)
 				retryCfg, retryOut, retryErr := config.NewTestConfig()
 				retryCfg.GitHubClientOverride = client
-				err := runSubmit(retryCfg, &submitOptions{auto: true})
+				err := runSubmit(retryCfg, &submitOptions{auto: true, noAtomic: tc.noAtomic})
 				_, diagnostics := commandOutput(t, retryCfg, retryOut, retryErr)
 				require.NoError(t, err, diagnostics)
 				assert.NoFileExists(t, modify.StatePath(dir))
@@ -2133,6 +2187,12 @@ func TestSubmit_PendingModifyCompletion(t *testing.T) {
 				assert.Zero(t, unstackCalls)
 			} else {
 				assert.Equal(t, 1, unstackCalls)
+			}
+			if tc.reorder {
+				assert.Equal(t, "b1", prs["b3"].BaseRefName)
+				assert.Equal(t, "b3", prs["b2"].BaseRefName)
+				require.NotNil(t, replacement)
+				assert.Equal(t, []int{10, 12, 11}, replacement.PullRequests)
 			}
 		})
 	}
@@ -2163,7 +2223,7 @@ func TestSubmit_PRFailureWithoutPendingModifyRemainsBestEffort(t *testing.T) {
 	require.NoError(t, runSubmit(cfg, &submitOptions{auto: true}))
 
 	_, output := commandOutput(t, cfg, outR, errR)
-	assert.Equal(t, 2, pushes)
+	assert.Equal(t, 1, pushes)
 	assert.Equal(t, 2, creations)
 	assert.Contains(t, output, "failed to create PR for b2")
 	assert.NoFileExists(t, modify.StatePath(dir))
@@ -2520,7 +2580,8 @@ func TestClearPendingModifyState_NoFile(t *testing.T) {
 	assert.False(t, modify.StateExists(gitDir))
 }
 
-func TestSubmit_WithPendingModify_SequentialPush(t *testing.T) {
+func TestSubmit_WithPendingModify_AtomicPush(t *testing.T) {
+	t.Setenv("GH_STACK_NO_ATOMIC", "")
 	s := stack.Stack{
 		ID:     "42",
 		Number: 7,
@@ -2543,7 +2604,7 @@ func TestSubmit_WithPendingModify_SequentialPush(t *testing.T) {
 	mock := newSubmitMock(tmpDir, "b1")
 	mock.PushFn = func(remote string, branches []string, force, atomic bool) error {
 		pushCalls = append(pushCalls, pushCall{remote, branches, force, atomic})
-		callOrder = append(callOrder, fmt.Sprintf("push:%s", branches[0]))
+		callOrder = append(callOrder, "push")
 		return nil
 	}
 
@@ -2616,36 +2677,15 @@ func TestSubmit_WithPendingModify_SequentialPush(t *testing.T) {
 	// Unstack called with old stack number
 	assert.Equal(t, 7, unstackedNumber)
 
-	// Push called per-branch (3 separate calls, not 1 atomic call)
-	require.Len(t, pushCalls, 3, "should push each branch individually")
-	assert.Equal(t, []string{"b1"}, pushCalls[0].branches)
-	assert.Equal(t, []string{"b2"}, pushCalls[1].branches)
-	assert.Equal(t, []string{"b3"}, pushCalls[2].branches)
-	for _, pc := range pushCalls {
-		assert.False(t, pc.atomic, "sequential push should not use atomic mode")
-	}
+	require.Len(t, pushCalls, 1)
+	assert.Equal(t, []string{"b1", "b2", "b3"}, pushCalls[0].branches)
+	assert.True(t, pushCalls[0].force)
+	assert.True(t, pushCalls[0].atomic)
 
 	// CreateStack called with all 3 PRs
 	assert.Equal(t, []int{10, 11, 12}, createdStackPRs)
 
-	// Verify ordering: unstack before push, push before create_stack
-	assert.True(t, len(callOrder) >= 5, "expected at least 5 calls, got %d: %v", len(callOrder), callOrder)
-	deleteIdx := -1
-	firstPushIdx := -1
-	createIdx := -1
-	for i, c := range callOrder {
-		if c == "unstack:7" && deleteIdx == -1 {
-			deleteIdx = i
-		}
-		if c == "push:b1" && firstPushIdx == -1 {
-			firstPushIdx = i
-		}
-		if c == "create_stack" && createIdx == -1 {
-			createIdx = i
-		}
-	}
-	assert.Greater(t, firstPushIdx, deleteIdx, "delete should happen before push")
-	assert.Greater(t, createIdx, firstPushIdx, "create_stack should happen after push")
+	assert.Equal(t, []string{"unstack:7", "push", "create_stack"}, callOrder)
 
 	// State file should be cleared
 	assert.False(t, modify.StateExists(tmpDir), "modify state file should be cleared after success")
@@ -2711,9 +2751,7 @@ func TestSubmit_FetchesBeforePush(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"b1", "b2"}, fetchedBranches, "should fetch active branches")
-	// fetch must come before all pushes
-	require.True(t, len(callOrder) >= 3, "expected at least 3 calls (fetch + 2 pushes)")
-	assert.Equal(t, "fetch", callOrder[0], "fetch must happen before any push")
+	assert.Equal(t, []string{"fetch", "push"}, callOrder)
 }
 
 func TestSubmit_UsesPRTemplate(t *testing.T) {
