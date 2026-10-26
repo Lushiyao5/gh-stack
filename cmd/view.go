@@ -166,7 +166,7 @@ func viewShort(cfg *config.Config, s *stack.Stack, currentBranch string) error {
 		indicator := branchStatusIndicator(cfg, s, b)
 		prSuffix := shortPRSuffix(cfg, b, repoHost, repoOwner, repoName)
 		if b.Branch == currentBranch {
-			cfg.Outf("» %s%s%s %s\n", cfg.ColorBold(b.Branch), indicator, prSuffix, cfg.ColorCyan("(current)"))
+			cfg.Outf("» %s%s%s %s\n", cfg.ColorBold(b.Branch), indicator, prSuffix, cfg.ColorAccent("(current)"))
 		} else if merged {
 			cfg.Outf("│ %s%s%s\n", cfg.ColorGray(b.Branch), indicator, prSuffix)
 		} else if queued {
@@ -315,13 +315,7 @@ func viewFullTUI(cfg *config.Config, s *stack.Stack, currentBranch string, prDet
 
 	model := stackview.New(reversed, s.Trunk, Version, s.Number).WithStackURL(cfg.StackURL(s.Number))
 
-	p := tea.NewProgram(
-		model,
-		tea.WithAltScreen(),
-		tea.WithMouseAllMotion(),
-	)
-
-	finalModel, err := p.Run()
+	finalModel, err := runFullScreenTUI(cfg, model, tea.WithMouseAllMotion())
 	if err != nil {
 		return fmt.Errorf("running TUI: %w", err)
 	}
@@ -393,7 +387,7 @@ func viewFullStatic(cfg *config.Config, s *stack.Stack, currentBranch string) er
 
 		branchName := cfg.ColorMagenta(b.Branch)
 		if isCurrent {
-			branchName = cfg.ColorCyan(b.Branch + " (current)")
+			branchName = cfg.ColorAccent(b.Branch + " (current)")
 		}
 
 		fmt.Fprintf(&buf, "%s %s %s%s\n", bullet, branchName, indicator, prInfo)
