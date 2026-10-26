@@ -300,6 +300,10 @@ type PRDetails struct {
 	IsDraft  bool
 	Merged   bool
 	IsQueued bool
+
+	// Merge evidence for a stack retargeted off this PR's branch.
+	HeadRefOID     string
+	MergeCommitOID string
 }
 
 // FindPRDetailsForBranch fetches enriched PR data for display purposes.
@@ -315,6 +319,10 @@ func (c *Client) FindPRDetailsForBranch(branch string) (*PRDetails, error) {
 					IsDraft         bool             `graphql:"isDraft"`
 					Merged          bool             `graphql:"merged"`
 					MergeQueueEntry *MergeQueueEntry `graphql:"mergeQueueEntry"`
+					HeadRefOID      string           `graphql:"headRefOid"`
+					MergeCommit     struct {
+						OID string `graphql:"oid"`
+					} `graphql:"mergeCommit"`
 				}
 			} `graphql:"pullRequests(headRefName: $head, last: 1)"`
 		} `graphql:"repository(owner: $owner, name: $name)"`
@@ -343,6 +351,9 @@ func (c *Client) FindPRDetailsForBranch(branch string) (*PRDetails, error) {
 		IsDraft:  n.IsDraft,
 		Merged:   n.Merged,
 		IsQueued: n.MergeQueueEntry != nil && n.MergeQueueEntry.ID != "",
+
+		HeadRefOID:     n.HeadRefOID,
+		MergeCommitOID: n.MergeCommit.OID,
 	}, nil
 }
 

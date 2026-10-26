@@ -475,7 +475,12 @@ func reconcileAndImportRemoteStack(cfg *config.Config, client github.ClientOps, 
 			if err := stack.Save(gitDir, sf); err != nil {
 				return nil, "", stackSaveError(cfg, err)
 			}
-			cfg.Successf("Local stack matches remote%s", linkedStackLabel(cfg, remoteStack.Number))
+			if base := remoteStack.Base.Ref; base != "" && localStack.Trunk.Branch != base {
+				cfg.Warningf("GitHub retargeted this stack%s from %s to %s", linkedStackLabel(cfg, remoteStack.Number), localStack.Trunk.Branch, base)
+				cfg.Printf("  Run `%s` to rebase the stack onto %s", cfg.ColorCyan("gh stack sync"), base)
+			} else {
+				cfg.Successf("Local stack matches remote%s", linkedStackLabel(cfg, remoteStack.Number))
+			}
 			return localStack, targetBranch, nil
 		}
 

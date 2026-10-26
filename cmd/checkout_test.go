@@ -1667,3 +1667,47 @@ func TestCheckout_ByPRURL_Remote(t *testing.T) {
 	assert.Equal(t, "feat-2", checkedOut)
 	assert.Contains(t, output, "Imported stack with 2 branches")
 }
+
+func TestCheckout_BaseRetarget(t *testing.T) {
+	t.Run("reports a tracked stack", func(t *testing.T) {
+		repo := setupBaseRetargetRepo(t, "main", false)
+		withIssue250Repo(t, repo.dir)
+		cfg, outR, errR := config.NewTestConfig()
+		cfg.GitHubClientOverride = repo.client
+
+		require.NoError(t, runCheckout(cfg, &checkoutOptions{target: "9"}))
+		_, diagnostics := commandOutput(t, cfg, outR, errR)
+		assert.Contains(t, diagnostics, "from parent to main")
+		assert.NotContains(t, diagnostics, "matches remote")
+		sf, err := stack.Load(repo.gitDir)
+		require.NoError(t, err)
+		assert.Equal(t, "parent", sf.Stacks[0].Trunk.Branch)
+	})
+
+	t.Run("keeps the old base until rebased", func(t *testing.T) {
+		// The child merged into the parent, which was deleted without merging.
+		repo := setupBaseRetargetRepo(t, "main", false)
+		withIssue250Repo(t, repo.dir)
+		sf, err := stack.Load(repo.gitDir)
+		require.NoError(t, err)
+		sf.Stacks = nil
+		require.NoError(t, stack.Save(repo.gitDir, sf))
+		child := issue250Git(t, repo.dir, "rev-parse", "child")
+		repo.client.FindPRByNumberFn = func(n int) (*github.PullRequest, error) {
+			if n == 11 {
+				return &github.PullRequest{Number: 11, HeadRefName: "child", BaseRefName: "parent", State: "MERGED", Merged: true, HeadRefOID: child}, nil
+			}
+			return &github.PullRequest{Number: 12, HeadRefName: "top", BaseRefName: "main", State: "OPEN"}, nil
+		}
+		cfg := issue250TestConfig(t)
+		cfg.GitHubClientOverride = repo.client
+
+		require.NoError(t, runCheckout(cfg, &checkoutOptions{target: "9"}))
+		sf, err = stack.Load(repo.gitDir)
+		require.NoError(t, err)
+		assert.Equal(t, "parent", sf.Stacks[0].Trunk.Branch)
+		top := issue250Git(t, repo.dir, "rev-parse", "top")
+		require.Error(t, runRebase(cfg, &rebaseOptions{remote: "origin"}), "dropping the unmerged parent needs consent")
+		assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
+	})
+}

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2/terminal"
 	"github.com/github/gh-stack/internal/config"
 	"github.com/github/gh-stack/internal/git"
 	"github.com/github/gh-stack/internal/github"
@@ -3819,6 +3820,352 @@ func TestRebase_LegacyCompletionRetainsRetryState(t *testing.T) {
 			assert.Equal(t, 1, continues, "completed publication must not repeat native continuation")
 			assert.Equal(t, "main", current)
 			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+		})
+	}
+}
+
+type baseRetargetRepo struct {
+	amendedParentRepo
+	target string
+	remote *github.RemoteStack
+	client *github.MockClient
+}
+
+// setupBaseRetargetRepo builds child <- top on a deleted parent branch whose
+// stack GitHub retargeted to target. When merged, target has the squashed parent.
+func setupBaseRetargetRepo(t *testing.T, target string, merged bool) baseRetargetRepo {
+	t.Helper()
+	repo := setupAmendedParentRepo(t, false)
+	issue250Git(t, repo.dir, "checkout", "-b", "top")
+	issue250WriteFile(t, repo.dir, "top.txt", "top\n")
+	issue250Git(t, repo.dir, "add", ".")
+	issue250Git(t, repo.dir, "commit", "-m", "top commit")
+	issue250Git(t, repo.dir, "push", "-u", "origin", "top")
+	issue250Git(t, repo.dir, "checkout", "-B", target, "main")
+	if merged {
+		issue250Git(t, repo.dir, "merge", "--squash", "origin/parent")
+		issue250Git(t, repo.dir, "commit", "-m", "squashed parent")
+	}
+	mergeCommit := issue250Git(t, repo.dir, "rev-parse", target)
+	issue250Git(t, repo.dir, "push", "origin", target)
+	issue250Git(t, repo.dir, "push", "origin", "--delete", "parent")
+	issue250Git(t, repo.dir, "checkout", "top")
+	child := issue250Git(t, repo.dir, "rev-parse", "child")
+	writeStackFile(t, repo.gitDir, stack.Stack{
+		ID: "9", Number: 9,
+		Trunk: stack.BranchRef{Branch: "parent", Head: repo.oldParent},
+		Branches: []stack.BranchRef{
+			{Branch: "child", Base: repo.oldParent, Head: child, PullRequest: &stack.PullRequestRef{Number: 11}},
+			{Branch: "top", Base: child, Head: issue250Git(t, repo.dir, "rev-parse", "top"), PullRequest: &stack.PullRequestRef{Number: 12}},
+		},
+	})
+	remote := &github.RemoteStack{ID: 9, Number: 9, Base: github.RemoteStackBase{Ref: target}, PullRequests: []int{11, 12}}
+	forbid := func(string) { t.Fatal("following a retarget must not restructure the stack on GitHub") }
+	client := &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) { return []github.RemoteStack{*remote}, nil },
+		GetStackFn:   func(int) (*github.RemoteStack, error) { return remote, nil },
+		FindPRByNumberFn: func(n int) (*github.PullRequest, error) {
+			heads := map[int]string{11: "child", 12: "top"}
+			return &github.PullRequest{Number: n, HeadRefName: heads[n], State: "OPEN"}, nil
+		},
+		FindPRDetailsForBranchFn: func(branch string) (*github.PRDetails, error) {
+			return &github.PRDetails{
+				Number: 10, Merged: merged && branch == "parent",
+				HeadRefOID: repo.oldParent, MergeCommitOID: mergeCommit,
+			}, nil
+		},
+		UnstackFn:      func(int) (*github.RemoteStack, bool, error) { forbid("unstack"); return nil, false, nil },
+		UpdatePRBaseFn: func(int, string) error { forbid("base"); return nil },
+		CreateStackFn:  func([]int) (*github.RemoteStack, error) { forbid("create"); return nil, nil },
+	}
+	return baseRetargetRepo{repo, target, remote, client}
+}
+
+func assertBaseRetargetHistory(t *testing.T, repo baseRetargetRepo) {
+	t.Helper()
+	assert.Equal(t, "top commit\nchild commit", issue250Git(t, repo.dir, "log", "--format=%s", repo.target+"..top"))
+	assert.Error(t, issue250GitMayFail(t, repo.dir, "merge-base", "--is-ancestor", repo.oldParent, "child"))
+	assert.Equal(t, repo.newParent, issue250Git(t, repo.dir, "rev-parse", "parent"), "the old local base is kept")
+	sf, err := stack.Load(repo.gitDir)
+	require.NoError(t, err)
+	s := sf.Stacks[0]
+	assert.Equal(t, "9", s.ID)
+	assert.Equal(t, repo.target, s.Trunk.Branch)
+	target := issue250Git(t, repo.dir, "rev-parse", repo.target)
+	assert.Equal(t, target, s.Trunk.Head)
+	assert.Equal(t, target, s.Branches[0].Base)
+}
+
+func TestRebase_BaseRetarget(t *testing.T) {
+	for _, target := range []string{"main", "release"} {
+		t.Run(target, func(t *testing.T) {
+			repo := setupBaseRetargetRepo(t, target, true)
+			withIssue250Repo(t, repo.dir)
+			cfg := issue250TestConfig(t)
+			cfg.GitHubClientOverride = repo.client
+
+			require.NoError(t, runRebase(cfg, &rebaseOptions{remote: "origin"}))
+			assertBaseRetargetHistory(t, repo)
+			top := issue250Git(t, repo.dir, "rev-parse", "top")
+			require.NoError(t, runRebase(cfg, &rebaseOptions{remote: "origin"}))
+			assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
+		})
+	}
+}
+
+func TestRebase_BaseRetargetConsent(t *testing.T) {
+	for _, mode := range []string{"non-interactive", "decline", "interrupt", "upstack", "accept", "flag"} {
+		t.Run(mode, func(t *testing.T) {
+			repo := setupBaseRetargetRepo(t, "main", false)
+			withIssue250Repo(t, repo.dir)
+			cfg := issue250TestConfig(t)
+			cfg.GitHubClientOverride = repo.client
+			cfg.ForceInteractive = mode == "decline" || mode == "interrupt" || mode == "accept"
+			cfg.ConfirmFn = func(_ string, defaultValue bool) (bool, error) {
+				assert.False(t, defaultValue)
+				if mode == "interrupt" {
+					return false, terminal.InterruptErr
+				}
+				return mode == "accept", nil
+			}
+			catalog, err := os.ReadFile(filepath.Join(repo.gitDir, "gh-stack"))
+			require.NoError(t, err)
+			top := issue250Git(t, repo.dir, "rev-parse", "top")
+
+			err = runRebase(cfg, &rebaseOptions{remote: "origin", upstack: mode == "upstack", acceptBaseChange: mode == "flag"})
+			if mode == "accept" || mode == "flag" {
+				require.NoError(t, err)
+				assertBaseRetargetHistory(t, repo)
+				assert.NoFileExists(t, filepath.Join(repo.dir, "old-parent.txt"))
+				return
+			}
+			require.Error(t, err)
+			after, err := os.ReadFile(filepath.Join(repo.gitDir, "gh-stack"))
+			require.NoError(t, err)
+			assert.Equal(t, string(catalog), string(after))
+			assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
+			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+		})
+	}
+}
+
+func TestRebase_BaseRetargetRecovery(t *testing.T) {
+	for _, action := range []string{"continue", "abort"} {
+		t.Run(action, func(t *testing.T) {
+			repo := setupBaseRetargetRepo(t, "main", true)
+			issue250Git(t, repo.dir, "checkout", "main")
+			issue250WriteFile(t, repo.dir, "child.txt", "conflict\n")
+			issue250Git(t, repo.dir, "add", ".")
+			issue250Git(t, repo.dir, "commit", "-m", "conflict")
+			issue250Git(t, repo.dir, "push", "origin", "main")
+			issue250Git(t, repo.dir, "checkout", "top")
+			withIssue250Repo(t, repo.dir)
+			cfg := issue250TestConfig(t)
+			cfg.GitHubClientOverride = repo.client
+			top := issue250Git(t, repo.dir, "rev-parse", "top")
+
+			require.ErrorIs(t, runRebase(cfg, &rebaseOptions{remote: "origin"}), ErrConflict)
+			state, err := loadRebaseState(repo.gitDir)
+			require.NoError(t, err)
+			assert.Equal(t, "main", state.TargetTrunk)
+			sf, err := stack.Load(repo.gitDir)
+			require.NoError(t, err)
+			assert.Equal(t, "parent", sf.Stacks[0].Trunk.Branch, "the trunk changes only after the rebase completes")
+
+			// Recovery keeps the target accepted when the rebase started.
+			repo.remote.Base.Ref = "later-base"
+			if action == "continue" {
+				issue250WriteFile(t, repo.dir, "child.txt", "resolved\n")
+				issue250Git(t, repo.dir, "add", "child.txt")
+				require.NoError(t, runRebase(cfg, &rebaseOptions{cont: true}))
+				assertBaseRetargetHistory(t, repo)
+			} else {
+				require.NoError(t, runRebase(cfg, &rebaseOptions{abort: true}))
+				sf, err = stack.Load(repo.gitDir)
+				require.NoError(t, err)
+				assert.Equal(t, "parent", sf.Stacks[0].Trunk.Branch)
+				assert.Equal(t, repo.oldParent, sf.Stacks[0].Branches[0].Base)
+				assert.Equal(t, top, issue250Git(t, repo.dir, "rev-parse", "top"))
+			}
+			assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+		})
+	}
+}
+
+// A crash after publishing the new trunk leaves a completed journal behind.
+func TestRebase_BaseRetargetCompletedJournal(t *testing.T) {
+	for _, action := range []string{"continue", "abort"} {
+		t.Run(action, func(t *testing.T) {
+			dir := t.TempDir()
+			original := stack.Stack{Trunk: stack.BranchRef{Branch: "parent", Head: "old-parent"}, Branches: []stack.BranchRef{{Branch: "b1", Base: "old-parent"}}}
+			published := original
+			published.Trunk.Branch = "main"
+			writeStackFile(t, dir, published)
+			restore := git.SetOps(newRebaseMock(dir, "b1"))
+			defer restore()
+			ctx, err := worktree.New()
+			require.NoError(t, err)
+			state := newWorktreeRebaseState(&original, ctx, "b1", map[string]string{"b1": "sha-b1"}, trunkTarget{Branch: "main", Ref: "main", SHA: "sha-main"}, 0, 1)
+			state.TargetTrunk = "main"
+			state.Phase, state.CurrentBranchIndex = "complete", state.EndIndex
+			require.NoError(t, saveRebaseState(dir, state))
+
+			require.NoError(t, runRebase(issue250TestConfig(t), &rebaseOptions{cont: action == "continue", abort: action == "abort"}))
+			sf, err := stack.Load(dir)
+			require.NoError(t, err)
+			want := map[string]string{"continue": "main", "abort": "parent"}[action]
+			assert.Equal(t, want, sf.Stacks[0].Trunk.Branch)
+			assert.NoFileExists(t, filepath.Join(dir, rebaseStateFile))
+		})
+	}
+}
+
+func TestRebase_BaseRetargetReviewCases(t *testing.T) {
+	testBaseRetargetReviewCases(t, func(cfg *config.Config, accept bool) error {
+		return runRebase(cfg, &rebaseOptions{remote: "origin", acceptBaseChange: accept})
+	})
+}
+
+func testBaseRetargetReviewCases(t *testing.T, run func(*config.Config, bool) error) {
+	t.Helper()
+	for _, scenario := range []string{
+		"stale local trunk", "old trunk reflog", "missing old trunk",
+		"missing cutoff", "planned fast-forward", "prefix merged before base",
+		"prefix merged after base", "prefix merged into target",
+		"merged elsewhere", "commits after merge", "amended before merge",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			target := "main"
+			if scenario == "merged elsewhere" {
+				target = "release"
+			}
+			prefix := strings.HasPrefix(scenario, "prefix")
+			merged := prefix || scenario == "merged elsewhere" ||
+				scenario == "commits after merge" || scenario == "amended before merge"
+			repo := setupBaseRetargetRepo(t, target, merged)
+			withIssue250Repo(t, repo.dir)
+			cfg := issue250TestConfig(t)
+			cfg.GitHubClientOverride = repo.client
+			sf, err := stack.Load(repo.gitDir)
+			require.NoError(t, err)
+			s := &sf.Stacks[0]
+			child := issue250Git(t, repo.dir, "rev-parse", "child")
+			wantConsent := false
+			accept := false
+			switch scenario {
+			case "stale local trunk":
+				issue250Git(t, repo.dir, "branch", "-f", "parent", "main")
+				wantConsent = true
+			case "old trunk reflog", "missing cutoff":
+				s.Trunk.Head = repo.newParent
+				s.Branches[0].Base = repo.newParent
+				accept = true
+				if scenario == "missing cutoff" {
+					issue250Git(t, repo.dir, "reflog", "expire", "--expire=now", "--all")
+				}
+			case "missing old trunk":
+				issue250Git(t, repo.dir, "branch", "-D", "parent")
+				accept = true
+			case "planned fast-forward":
+				// The fetched child contains a parent update that the local child
+				// has not seen yet; consent must cover the post-fast-forward history.
+				issue250Git(t, repo.dir, "branch", "-f", "main", repo.oldParent)
+				issue250Git(t, repo.dir, "push", "origin", "main")
+				issue250Git(t, repo.dir, "checkout", "-B", "parent", repo.oldParent)
+				issue250WriteFile(t, repo.dir, "parent-extra.txt", "unmerged parent update\n")
+				issue250Git(t, repo.dir, "add", ".")
+				issue250Git(t, repo.dir, "commit", "-m", "parent extra")
+				issue250Git(t, repo.dir, "checkout", "child")
+				issue250Git(t, repo.dir, "merge", "--no-edit", "parent")
+				issue250Git(t, repo.dir, "push", "origin", "child")
+				issue250Git(t, repo.dir, "checkout", "top")
+				issue250Git(t, repo.dir, "branch", "-f", "child", child)
+				wantConsent = true
+			case "prefix merged before base", "prefix merged after base", "prefix merged into target":
+				s.Branches[0].PullRequest.Merged = true
+				s.Branches[0].PullRequest.MergedHead = child
+				lookup := repo.client.FindPRByNumberFn
+				repo.client.FindPRByNumberFn = func(n int) (*github.PullRequest, error) {
+					pr, err := lookup(n)
+					if n == 11 {
+						pr.Merged, pr.State, pr.HeadRefOID = true, "MERGED", child
+					}
+					return pr, err
+				}
+				wantConsent = scenario == "prefix merged after base"
+				if wantConsent {
+					break
+				}
+				// The child's changes reached main through the parent or directly.
+				issue250Git(t, repo.dir, "checkout", "main")
+				issue250Git(t, repo.dir, "merge", "--squash", "origin/child")
+				issue250Git(t, repo.dir, "commit", "-m", "squashed child")
+				issue250Git(t, repo.dir, "push", "origin", "main")
+				issue250Git(t, repo.dir, "checkout", "top")
+				squash := issue250Git(t, repo.dir, "rev-parse", "main")
+				details := repo.client.FindPRDetailsForBranchFn
+				repo.client.FindPRDetailsForBranchFn = func(branch string) (*github.PRDetails, error) {
+					pr, err := details(branch)
+					if scenario == "prefix merged before base" && branch == "parent" {
+						pr.HeadRefOID = repo.newParent // the parent took the child before merging
+					} else if scenario == "prefix merged into target" && branch == "child" {
+						pr.Merged, pr.HeadRefOID, pr.MergeCommitOID = true, child, squash
+					}
+					return pr, err
+				}
+			case "merged elsewhere":
+				repo.remote.Base.Ref = "main"
+				target = "main"
+				wantConsent = true
+			case "commits after merge":
+				issue250Git(t, repo.dir, "checkout", "-B", "parent", repo.oldParent)
+				issue250WriteFile(t, repo.dir, "parent-extra.txt", "not in the merged PR\n")
+				issue250Git(t, repo.dir, "add", ".")
+				issue250Git(t, repo.dir, "commit", "-m", "parent extra")
+				issue250Git(t, repo.dir, "rebase", "--onto", "parent", repo.oldParent, "child")
+				issue250Git(t, repo.dir, "rebase", "--onto", "child", child, "top")
+				s.Trunk.Head = issue250Git(t, repo.dir, "rev-parse", "parent")
+				s.Branches[0].Base = s.Trunk.Head
+				s.Branches[1].Base = issue250Git(t, repo.dir, "rev-parse", "child")
+				wantConsent = true
+			case "amended before merge":
+				// The parent was amended after the child last synced, then merged.
+				details := repo.client.FindPRDetailsForBranchFn
+				repo.client.FindPRDetailsForBranchFn = func(branch string) (*github.PRDetails, error) {
+					pr, err := details(branch)
+					pr.HeadRefOID = repo.newParent
+					return pr, err
+				}
+			}
+			require.NoError(t, stack.Save(repo.gitDir, sf))
+			before, err := os.ReadFile(filepath.Join(repo.gitDir, "gh-stack"))
+			require.NoError(t, err)
+			refs := issue250Git(t, repo.dir, "rev-parse", "child", "top", "origin/child", "origin/top")
+
+			err = run(cfg, accept)
+			if wantConsent || scenario == "missing cutoff" {
+				require.Error(t, err)
+				after, readErr := os.ReadFile(filepath.Join(repo.gitDir, "gh-stack"))
+				require.NoError(t, readErr)
+				assert.Equal(t, before, after)
+				assert.Equal(t, refs, issue250Git(t, repo.dir, "rev-parse", "child", "top", "origin/child", "origin/top"))
+				assert.NoFileExists(t, filepath.Join(repo.gitDir, rebaseStateFile))
+				if scenario == "missing cutoff" {
+					return
+				}
+				err = run(cfg, true)
+			}
+			require.NoError(t, err)
+			wantCommits := "top commit\nchild commit"
+			if prefix {
+				wantCommits = "top commit"
+			}
+			assert.Equal(t, wantCommits, issue250Git(t, repo.dir, "log", "--format=%s", target+"..top"))
+			assert.NoFileExists(t, filepath.Join(repo.dir, "parent-extra.txt"))
+			after, err := stack.Load(repo.gitDir)
+			require.NoError(t, err)
+			assert.Equal(t, target, after.Stacks[0].Trunk.Branch)
+			assert.Equal(t, "9", after.Stacks[0].ID)
 		})
 	}
 }

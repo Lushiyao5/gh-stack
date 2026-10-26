@@ -148,7 +148,7 @@ func TestViewJSON(t *testing.T) {
 			defer outR.Close()
 
 			tt.stack.Number = 7
-			err := viewJSON(cfg, tt.stack, tt.currentBranch)
+			err := viewJSON(cfg, tt.stack, tt.currentBranch, false)
 			require.NoError(t, err)
 			cfg.Out.Close()
 
@@ -206,7 +206,7 @@ func TestViewJSON_BranchFields(t *testing.T) {
 	cfg, outR, _ := config.NewTestConfig()
 	defer outR.Close()
 
-	err := viewJSON(cfg, s, "feat/02")
+	err := viewJSON(cfg, s, "feat/02", false)
 	require.NoError(t, err)
 	cfg.Out.Close()
 
@@ -621,4 +621,40 @@ func TestRunViewJSON_SharedCatalogDuringMutation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "read-only metadata refresh cannot overwrite a mutation's catalog")
 	assert.NoFileExists(t, filepath.Join(local, "gh-stack"))
+}
+
+func TestView_BaseRetarget(t *testing.T) {
+	for _, trunk := range []string{"parent", "origin/main"} {
+		t.Run(trunk, func(t *testing.T) {
+			repo := setupBaseRetargetRepo(t, "main", false)
+			withIssue250Repo(t, repo.dir)
+			retargeted := trunk == "parent"
+			if !retargeted {
+				// A remote-qualified trunk matching GitHub's base is not a retarget.
+				sf, err := stack.Load(repo.gitDir)
+				require.NoError(t, err)
+				sf.Stacks[0].Trunk.Branch = trunk
+				require.NoError(t, stack.Save(repo.gitDir, sf))
+			}
+			catalog, err := os.ReadFile(filepath.Join(repo.gitDir, "gh-stack"))
+			require.NoError(t, err)
+			cfg, outR, errR := config.NewTestConfig()
+			cfg.GitHubClientOverride = repo.client
+
+			require.NoError(t, runView(cfg, &viewOptions{asJSON: true}))
+			out, diagnostics := commandOutput(t, cfg, outR, errR)
+			var data viewJSONOutput
+			require.NoError(t, json.Unmarshal([]byte(out), &data))
+			assert.Equal(t, trunk, data.Trunk)
+			assert.Equal(t, retargeted, data.Branches[0].NeedsRebase, "only a retargeted bottom branch needs a rebase")
+			if retargeted {
+				assert.Contains(t, diagnostics, "from parent to main")
+			} else {
+				assert.NotContains(t, diagnostics, "retargeted")
+			}
+			after, err := os.ReadFile(filepath.Join(repo.gitDir, "gh-stack"))
+			require.NoError(t, err)
+			assert.Equal(t, string(catalog), string(after))
+		})
+	}
 }
