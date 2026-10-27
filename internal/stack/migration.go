@@ -208,6 +208,12 @@ func legacyCatalogs(commonDir string) ([]migrationCatalog, error) {
 	var catalogs []migrationCatalog
 	for _, entry := range entries {
 		path := filepath.Join(dir, entry.Name())
+		if entry.Type().IsRegular() {
+			// Stray files such as .DS_Store are not worktree administration
+			// directories; skipping them keeps every stack command working
+			// when one is dropped here.
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return nil, fmt.Errorf("inspecting worktree administration path %q: %w", path, err)

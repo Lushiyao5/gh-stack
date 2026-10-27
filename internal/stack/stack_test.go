@@ -1057,9 +1057,6 @@ func TestLegacyState_MetadataErrors(t *testing.T) {
 		{"worktrees is a file", func(t *testing.T, dir string) {
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "worktrees"), []byte("not a directory"), 0600))
 		}},
-		{"admin entry is a file", func(t *testing.T, dir string) {
-			writeMigrationTestData(t, dir, "worktrees/not-a-directory", []byte("metadata"))
-		}},
 		{"catalog is a directory", func(t *testing.T, dir string) {
 			require.NoError(t, os.MkdirAll(filepath.Join(dir, "worktrees", "linked", stackFileName), 0755))
 		}},
@@ -1124,6 +1121,33 @@ func TestLegacyState_MetadataErrors(t *testing.T) {
 			assert.NoFileExists(t, stackFilePath(dir))
 		})
 	}
+}
+
+func TestLegacyState_SkipsStrayFilesInAdministrationDirectory(t *testing.T) {
+	t.Run("stray file alone is not legacy state", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "worktrees", "linked"), 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "worktrees", ".DS_Store"), []byte("junk"), 0600))
+		has, err := HasLegacyState(dir)
+		require.NoError(t, err)
+		assert.False(t, has)
+		require.NoError(t, migrateWithTestOperationLock(t, dir))
+		assert.NoFileExists(t, stackFilePath(dir))
+		assert.NoFileExists(t, filepath.Join(dir, migrationFileName))
+		assert.FileExists(t, filepath.Join(dir, "worktrees", ".DS_Store"))
+	})
+
+	t.Run("stray file does not block migrating a sibling catalog", func(t *testing.T) {
+		dir := t.TempDir()
+		catalog := writeMigrationTestCatalog(t, dir, "worktrees/linked/gh-stack", migrationTestFile(makeStack("main", "linked")))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "worktrees", ".DS_Store"), []byte("junk"), 0600))
+		has, err := HasLegacyState(dir)
+		require.NoError(t, err)
+		assert.True(t, has)
+		require.NoError(t, migrateWithTestOperationLock(t, dir))
+		assertMigrationOriginals(t, dir, []migrationCatalog{catalog}, true)
+		assert.FileExists(t, filepath.Join(dir, "worktrees", ".DS_Store"))
+	})
 }
 
 func TestMigrateLegacyState_BackupCollisions(t *testing.T) {
